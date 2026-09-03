@@ -1,4 +1,3 @@
-// bot/internal/bot/bot.go
 package bot
 
 import (
@@ -7,10 +6,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/0xProgress/simlife/bot/internal/commands"
+	"github.com/0xProgress/simlife/bot/internal/config"
+	"github.com/0xProgress/simlife/bot/internal/logger"
 	"github.com/bwmarrin/discordgo"
-	"github.com/simlife/bot/internal/commands"
-	"github.com/simlife/bot/internal/config"
-	"github.com/simlife/bot/internal/logger"
 )
 
 // Bot manages the DiscordGo session and lifecycle events.
@@ -45,22 +44,27 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 
 	// Lifecycle hooks for operational logging
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		logger.Package("bot").Info().
+		log := logger.Package("bot")
+		log.Info().
 			Str("username", s.State.User.Username).
 			Str("discriminator", s.State.User.Discriminator).
 			Msg("bot successfully connected to Discord gateway")
 	})
 
 	session.AddHandler(func(s *discordgo.Session, c *discordgo.Connect) {
-		logger.Package("bot").Info().Msg("websocket connection established")
+		log := logger.Package("bot")
+		log.Info().Msg("websocket connection established")
 	})
 
 	session.AddHandler(func(s *discordgo.Session, d *discordgo.Disconnect) {
-		logger.Package("bot").Warn().Msg("websocket disconnected, attempting automatic reconnection")
+		log := logger.Package("bot")
+		log.Warn().Msg("websocket disconnected, attempting automatic reconnection")
 	})
 
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resume) {
-		logger.Package("bot").Info().Msg("websocket session resumed")
+	// Fix: The correct event struct for a resumed session is *discordgo.Resumed
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) {
+		log := logger.Package("bot")
+		log.Info().Msg("websocket session resumed")
 	})
 
 	return b, nil
@@ -108,6 +112,7 @@ func (b *Bot) Start() error {
 func (b *Bot) updateStatus(status string) {
 	err := b.session.UpdateGameStatus(0, status)
 	if err != nil {
-		logger.Package("bot").Error().Err(err).Msg("failed to update presence status")
+		log := logger.Package("bot")
+		log.Error().Err(err).Msg("failed to update presence status")
 	}
 }

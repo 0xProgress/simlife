@@ -1,15 +1,13 @@
-// bot/cmd/simlife/main.go
 package main
 
 import (
 	"context"
 	"net/http"
-	"os"
 	"time"
 
-	"github.com/simlife/bot/internal/bot"
-	"github.com/simlife/bot/internal/config"
-	"github.com/simlife/bot/internal/logger"
+	"github.com/0xProgress/simlife/bot/internal/bot"
+	"github.com/0xProgress/simlife/bot/internal/config"
+	"github.com/0xProgress/simlife/bot/internal/logger"
 )
 
 func main() {
@@ -77,14 +75,16 @@ func main() {
 
 	// 12. Graceful shutdown sequence
 	log.Info().Msg("shutdown signal received, initiating graceful drain")
-	
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
-		log.Error().Err(err).Msg("HTTP server forced shutdown due to timeout")
+		// Fix: Assign to variable to make it addressable for pointer method
+		httpLog := logger.Package("http")
+		httpLog.Error().Err(err).Msg("HTTP server forced shutdown due to timeout")
 	}
-	
+
 	log.Info().Msg("Simlife bot service stopped cleanly")
 }
 
@@ -105,7 +105,8 @@ func startHTTPServer(port string) *http.Server {
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Package("http").Error().Err(err).Msg("HTTP server encountered unexpected error")
+			httpLog := logger.Package("http")
+			httpLog.Error().Err(err).Msg("HTTP server encountered unexpected error")
 		}
 	}()
 

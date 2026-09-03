@@ -1,4 +1,3 @@
-// bot/internal/bot/middleware.go
 package bot
 
 import (
@@ -6,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/0xProgress/simlife/bot/internal/commands"
+	"github.com/0xProgress/simlife/bot/internal/config"
+	"github.com/0xProgress/simlife/bot/internal/logger"
 	"github.com/bwmarrin/discordgo"
-	"github.com/simlife/bot/internal/commands"
-	"github.com/simlife/bot/internal/config"
-	"github.com/simlife/bot/internal/logger"
 )
 
 // LoggingMiddleware logs the start and end of command execution with duration.
@@ -18,10 +17,10 @@ func LoggingMiddleware() commands.Middleware {
 		return func(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 			start := time.Now()
 			cmdName := i.ApplicationCommandData().Name
-			
-			log := logger.Package("middleware").With().
-				Str("command", cmdName).
-				Logger()
+
+			// Fix: Assign to variable first to ensure addressability for .With() and level methods
+			baseLog := logger.Package("middleware")
+			log := baseLog.With().Str("command", cmdName).Logger()
 
 			log.Debug().Msg("command execution initiated")
 
@@ -54,7 +53,7 @@ func AuthMiddleware() commands.Middleware {
 
 			// TODO: Query PostgreSQL via ledger/db package to confirm player existence.
 			// Create new player ledger accounts if they do not exist.
-			
+
 			ctx = context.WithValue(ctx, commands.PlayerIDKey, userID)
 			return next(ctx, s, i)
 		}
@@ -76,7 +75,7 @@ func FeatureFlagMiddleware(cfg *config.Config) commands.Middleware {
 	return func(next commands.Handler) commands.Handler {
 		return func(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 			cmdName := i.ApplicationCommandData().Name
-			
+
 			var layer string
 			for _, cmd := range commands.Registry {
 				if cmd.Command.Name == cmdName {
