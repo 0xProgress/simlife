@@ -1,4 +1,3 @@
-// bot/internal/config/config.go
 package config
 
 import (
@@ -8,45 +7,44 @@ import (
 	"strings"
 )
 
-// Config holds all runtime configuration for the Simlife bot service.
 type Config struct {
-	DiscordToken     string
-	DiscordAppID     string
-	DiscordPublicKey string
-	PostgresDSN      string
-	RedisAddr        string
-	NatsURL          string
-	JWTSecret        string
-	SettlementCron   string
-	ActivityClientID string
-	LogLevel         string
-	LogFormat        string
-	HTTPPort         string
-	Features         FeatureFlags
+	DiscordToken        string
+	DiscordAppID        string
+	DiscordPublicKey    string
+	PostgresDSN         string
+	RedisAddr           string
+	NatsURL             string
+	JWTSecret           string
+	SettlementCron      string
+	ActivityClientID    string
+	LogLevel            string
+	LogFormat           string
+	HTTPPort            string
+	WorkCooldownMinutes int // Added for /work command cooldown
+	Features            FeatureFlags
 }
 
-// FeatureFlags controls the availability of specific command layers.
 type FeatureFlags struct {
 	MarketEnabled   bool
 	PropertyEnabled bool
 	BusinessEnabled bool
 }
 
-// Load reads configuration from environment variables and validates required fields.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DiscordToken:     os.Getenv("DISCORD_BOT_TOKEN"),
-		DiscordAppID:     os.Getenv("DISCORD_APP_ID"),
-		DiscordPublicKey: os.Getenv("DISCORD_PUBLIC_KEY"),
-		PostgresDSN:      os.Getenv("POSTGRES_DSN"),
-		RedisAddr:        os.Getenv("REDIS_ADDR"),
-		NatsURL:          os.Getenv("NATS_URL"),
-		JWTSecret:        os.Getenv("JWT_SECRET"),
-		SettlementCron:   os.Getenv("SETTLEMENT_CRON"),
-		ActivityClientID: os.Getenv("ACTIVITY_CLIENT_ID"),
-		LogLevel:         getEnvDefault("LOG_LEVEL", "info"),
-		LogFormat:        getEnvDefault("LOG_FORMAT", "json"),
-		HTTPPort:         getEnvDefault("HTTP_PORT", "8080"),
+		DiscordToken:        os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordAppID:        os.Getenv("DISCORD_APP_ID"),
+		DiscordPublicKey:    os.Getenv("DISCORD_PUBLIC_KEY"),
+		PostgresDSN:         os.Getenv("POSTGRES_DSN"),
+		RedisAddr:           os.Getenv("REDIS_ADDR"),
+		NatsURL:             os.Getenv("NATS_URL"),
+		JWTSecret:           os.Getenv("JWT_SECRET"),
+		SettlementCron:      os.Getenv("SETTLEMENT_CRON"),
+		ActivityClientID:    os.Getenv("ACTIVITY_CLIENT_ID"),
+		LogLevel:            getEnvDefault("LOG_LEVEL", "info"),
+		LogFormat:           getEnvDefault("LOG_FORMAT", "json"),
+		HTTPPort:            getEnvDefault("HTTP_PORT", "8080"),
+		WorkCooldownMinutes: getIntEnvDefault("WORK_COOLDOWN_MINUTES", 60),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -54,7 +52,6 @@ func Load() (*Config, error) {
 	}
 
 	cfg.parseFeatureFlags()
-
 	return cfg, nil
 }
 
@@ -90,6 +87,18 @@ func getEnvDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+func getIntEnvDefault(key string, defaultVal int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		return defaultVal
+	}
+	return i
 }
 
 func parseBoolEnv(key string, defaultVal bool) bool {
