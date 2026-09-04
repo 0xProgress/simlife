@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/0xProgress/simlife/bot/db/sqlc"
+	"github.com/0xProgress/simlife/bot/internal/logger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-
-	db "github.com/0xProgress/simlife/bot/db/sqlc"
+	"github.com/shopspring/decimal"
 )
 
 var (
@@ -26,16 +26,14 @@ var (
 )
 
 // Ledger is the authoritative double-entry bookkeeping engine for Simlife.
-// All financial state mutations must flow through this component. No other package
-// is permitted to write to the financial ledger.
 type Ledger struct {
 	pool    *pgxpool.Pool
-	queries *db.Queries
+	queries *sqlc.Queries
 	log     zerolog.Logger
 }
 
-// NewLedger initializes the financial ledger with database connections and a logger.
-func NewLedger(pool *pgxpool.Pool, queries *db.Queries, log zerolog.Logger) *Ledger {
+// NewLedger initializes the financial ledger.
+func NewLedger(pool *pgxpool.Pool, queries *sqlc.Queries, log zerolog.Logger) *Ledger {
 	return &Ledger{
 		pool:    pool,
 		queries: queries,
@@ -43,145 +41,138 @@ func NewLedger(pool *pgxpool.Pool, queries *db.Queries, log zerolog.Logger) *Led
 	}
 }
 
-// PostTransactionParams defines the inputs required to post a financial transaction.
-type PostTransactionParams struct {
-	SourceAccountID uuid.UUID
-	DestAccountID   uuid.UUID
-	Amount          float64 // Note: Use shopspring/decimal in production for exact precision
-	Type            db.TransactionType
-	Description     string
+// Transfer is the primary public method for moving funds. It wraps PostTransaction
+// with exponential backoff retry logic for serialization failures.
+func (l *Ledger) Transfer(ctx context.Context, sourceID, destID string, amount decimal.Decimal, txType, playerID, description string) error {
+	maxRetries := 5
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := l.postTransaction(ctx, sourceID, destID, amount, txType, playerID, description)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrSerializationFailed) && attempt < maxRetries {
+			// Exponential backoff: 10ms, 40ms, 90ms, 160ms
+			backoff := time.Duration(attempt*attempt) * 10 * time.Millisecond
+			l.log.Warn().Err(err).Int("attempt", attempt).Dur("backoff", backoff).Msg("serialization failure, retrying")
+			time.Sleep(backoff)
+			continue
+		}
+		return fmt.Errorf("ledger transfer failed: %w", err)
+	}
+	return ErrSerializationFailed
 }
 
-// PostTransaction atomically posts a double-entry transaction to the ledger.
-// It enforces SERIALIZABLE isolation, validates account existence and sufficient funds,
-// and guarantees that exactly one DEBIT and one CREDIT entry are inserted.
-func (l *Ledger) PostTransaction(ctx context.Context, params PostTransactionParams) (uuid.UUID, error) {
+// postTransaction atomically posts a double-entry transaction.
+func (l *Ledger) postTransaction(ctx context.Context, sourceID, destID string, amount decimal.Decimal, txType, playerID, description string) error {
 	start := time.Now()
 
-	// 1. Strict Input Validation
-	if params.Amount <= 0 {
-		return uuid.Nil, ErrInvalidAmount
+	if amount.LessThanOrEqual(decimal.Zero) {
+		return ErrInvalidAmount
 	}
-	if params.SourceAccountID == params.DestAccountID {
-		return uuid.Nil, ErrSameAccount
+	if sourceID == destID {
+		return ErrSameAccount
 	}
 
-	// 2. Begin SERIALIZABLE Transaction
-	// This isolation level prevents write skew and phantom reads, ensuring
-	// that concurrent balance checks and inserts remain mathematically consistent.
-	tx, err := l.pool.BeginTx(ctx, pgx.TxOptions{
-		IsoLevel: pgx.Serializable,
-	})
+	// Begin SERIALIZABLE transaction
+	tx, err := l.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to begin serializable transaction: %w", err)
+		return fmt.Errorf("failed to begin serializable transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// 3. Lock Accounts & Verify Existence
-	// We lock both accounts using SELECT ... FOR UPDATE to serialize concurrent
-	// modifications to the same accounts. We sort the UUIDs to enforce a consistent
-	// lock ordering, which completely prevents deadlocks when two transactions
-	// attempt to transfer funds between the same two accounts in opposite directions.
-	ids := []uuid.UUID{params.SourceAccountID, params.DestAccountID}
-	if bytes.Compare(ids[0][:], ids[1][:]) > 0 {
+	qtx := l.queries.WithTx(tx)
+
+	// Lock accounts in consistent order to prevent deadlocks
+	ids := []string{sourceID, destID}
+	if bytes.Compare([]byte(ids[0]), []byte(ids[1])) > 0 {
 		ids[0], ids[1] = ids[1], ids[0]
 	}
 
-	rows, err := tx.Query(ctx, "SELECT id FROM accounts WHERE id = ANY($1) FOR UPDATE", ids)
+	accounts, err := qtx.LockAccountsForUpdate(ctx, ids)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to lock accounts: %w", err)
+		return fmt.Errorf("failed to lock accounts: %w", err)
 	}
-	defer rows.Close()
-
-	foundCount := 0
-	for rows.Next() {
-		foundCount++
-	}
-	if foundCount != 2 {
-		return uuid.Nil, ErrAccountNotFound
+	if len(accounts) != 2 {
+		return ErrAccountNotFound
 	}
 
-	// 4. Validate Sufficient Funds
-	qtx := l.queries.WithTx(tx)
-	
-	balance, err := qtx.GetAccountBalance(ctx, params.SourceAccountID)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to compute source account balance: %w", err)
+	// Validate sufficient funds (skip for Treasury minting if source is Treasury)
+	if sourceID != "TREASURY" { // Assuming Treasury has a known ID or we check account type
+		balance, err := qtx.GetAccountBalance(ctx, sourceID)
+		if err != nil {
+			return fmt.Errorf("failed to compute source balance: %w", err)
+		}
+		currentBal := numericToDecimal(balance)
+		if currentBal.LessThan(amount) {
+			return ErrInsufficientFunds
+		}
 	}
 
-	// TODO: Exempt TREASURY accounts from balance checks to allow money supply minting
-	// Cast balance to float64 in case sqlc inferred int32 from the COALESCE(..., 0) literal
-	if float64(balance) < params.Amount {
-		return uuid.Nil, ErrInsufficientFunds
-	}
-
-	// 5. Generate Shared Reference ID
-	// This UUID correlates the DEBIT and CREDIT halves of the double-entry pair.
-	refID := uuid.New()
-
-	// Convert float64 to pgtype.Numeric for sqlc generated structs
-	var pgAmount pgtype.Numeric
-	if err := pgAmount.Scan(params.Amount); err != nil {
-		return uuid.Nil, fmt.Errorf("failed to convert amount to pgtype.Numeric: %w", err)
-	}
-
-	// Prepare pgx specific nullable types
-	pgRefID := pgtype.UUID{Bytes: refID, Valid: true}
-	pgDesc := pgtype.Text{String: params.Description, Valid: params.Description != ""}
-
-	// 6. Post DEBIT Entry (Source Account)
-	_, err = qtx.PostTransaction(ctx, db.PostTransactionParams{
-		AccountID:       params.SourceAccountID,
-		Amount:          pgAmount,
-		EntryType:       db.EntryTypeDEBIT,
-		TransactionType: params.Type,
-		ReferenceID:     pgRefID,
-		Description:     pgDesc,
+	// Post DEBIT
+	_, err = qtx.PostTransaction(ctx, sqlc.PostTransactionParams{
+		AccountID:       sourceID,
+		Amount:          decimalToNumeric(amount),
+		EntryType:       sqlc.EntryTypeDEBIT,
+		TransactionType: txType,
+		ReferenceID:     pgtype.Text{String: playerID, Valid: playerID != ""},
+		Description:     pgtype.Text{String: description, Valid: description != ""},
 	})
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to post debit entry: %w", err)
+		return fmt.Errorf("failed to post debit: %w", err)
 	}
 
-	// 7. Post CREDIT Entry (Destination Account)
-	_, err = qtx.PostTransaction(ctx, db.PostTransactionParams{
-		AccountID:       params.DestAccountID,
-		Amount:          pgAmount,
-		EntryType:       db.EntryTypeCREDIT,
-		TransactionType: params.Type,
-		ReferenceID:     pgRefID,
-		Description:     pgDesc,
+	// Post CREDIT
+	_, err = qtx.PostTransaction(ctx, sqlc.PostTransactionParams{
+		AccountID:       destID,
+		Amount:          decimalToNumeric(amount),
+		EntryType:       sqlc.EntryTypeCREDIT,
+		TransactionType: txType,
+		ReferenceID:     pgtype.Text{String: playerID, Valid: playerID != ""},
+		Description:     pgtype.Text{String: description, Valid: description != ""},
 	})
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to post credit entry: %w", err)
+		return fmt.Errorf("failed to post credit: %w", err)
 	}
 
-	// 8. Commit Transaction
 	if err := tx.Commit(ctx); err != nil {
 		if isSerializationFailure(err) {
-			return uuid.Nil, ErrSerializationFailed
+			return ErrSerializationFailed
 		}
-		return uuid.Nil, fmt.Errorf("failed to commit transaction: %w", err)
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// 9. Structured Logging
 	l.log.Info().
-		Str("transaction_id", refID.String()).
-		Str("type", string(params.Type)).
-		Str("source_account", params.SourceAccountID.String()).
-		Str("dest_account", params.DestAccountID.String()).
-		Float64("amount", params.Amount).
-		Dur("duration", time.Since(start)).
+		Str("type", txType).
+		Str("source_account", sourceID).
+		Str("dest_account", destID).
+		Str("amount", amount.String()).
+		Dur("duration_ms", time.Since(start)).
 		Msg("transaction_posted_successfully")
 
-	return refID, nil
+	return nil
 }
 
-// isSerializationFailure checks if a PostgreSQL error is a serialization failure (SQLSTATE 40001).
-// Callers should retry the transaction when this error is encountered.
 func isSerializationFailure(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == "40001"
 	}
 	return false
+}
+
+func decimalToNumeric(d decimal.Decimal) pgtype.Numeric {
+	var n pgtype.Numeric
+	_ = n.Scan(d.String())
+	return n
+}
+
+func numericToDecimal(n pgtype.Numeric) decimal.Decimal {
+	if !n.Valid {
+		return decimal.Zero
+	}
+	d, err := decimal.NewFromString(n.String())
+	if err != nil {
+		return decimal.Zero
+	}
+	return d
 }

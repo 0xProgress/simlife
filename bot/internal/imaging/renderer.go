@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"image/color"
 	"net/http"
+	"strings"
 	"time"
 
 	imgutil "github.com/disintegration/imaging"
 	"github.com/fogleman/gg"
 	"github.com/golang/freetype/truetype"
+	"github.com/shopspring/decimal"
 	"golang.org/x/image/font"
 
 	"github.com/0xProgress/simlife/bot/internal/imaging/layouts"
@@ -57,10 +59,12 @@ func (r *Renderer) DrawTextAnchored(x, y float64, text string, fontType int, siz
 	r.dc.DrawStringAnchored(text, x, y, anchorX, anchorY)
 }
 
-func (r *Renderer) DrawCurrencyValue(x, y float64, amount int64, clr color.Color) {
+// DrawCurrencyValue renders a financial value with the game's currency symbol (⊄).
+// STRICT RULE: Uses decimal.Decimal to prevent any float64/int64 precision loss.
+func (r *Renderer) DrawCurrencyValue(x, y float64, amount decimal.Decimal, clr color.Color) {
 	r.setFont(layouts.FontMono, 48)
 	r.dc.SetColor(clr)
-	r.dc.DrawString(fmt.Sprintf("$%s", formatCurrency(amount)), x, y)
+	r.dc.DrawString(fmt.Sprintf("⊄%s", formatCurrency(amount)), x, y)
 }
 
 func (r *Renderer) DrawProgressBar(x, y, width, height, percent float64, clr color.Color) {
@@ -148,22 +152,26 @@ func (r *Renderer) DrawAvatar(x, y, size float64, imageURL string) {
 	r.dc.Pop()
 }
 
-// formatCurrency adds comma separators to large integers.
-func formatCurrency(amount int64) string {
-	if amount < 0 {
-		return "-" + formatCurrency(-amount)
+// formatCurrency adds comma separators to large decimal values.
+func formatCurrency(amount decimal.Decimal) string {
+	// Split into integer and fractional parts
+	parts := strings.Split(amount.String(), ".")
+	intPart := parts[0]
+	fracPart := ""
+	if len(parts) > 1 {
+		fracPart = "." + parts[1]
 	}
-	str := fmt.Sprintf("%d", amount)
-	if len(str) <= 3 {
-		return str
+
+	if len(intPart) <= 3 {
+		return intPart + fracPart
 	}
 
 	var res []byte
-	for i, c := range str {
-		if i > 0 && (len(str)-i)%3 == 0 {
+	for i, c := range intPart {
+		if i > 0 && (len(intPart)-i)%3 == 0 {
 			res = append(res, ',')
 		}
 		res = append(res, byte(c))
 	}
-	return string(res)
+	return string(res) + fracPart
 }

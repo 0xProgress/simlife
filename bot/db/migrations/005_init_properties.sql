@@ -1,3 +1,4 @@
+-- 005_init_properties.sql (Updated)
 CREATE TABLE properties (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     x_coord INTEGER NOT NULL,
@@ -7,6 +8,8 @@ CREATE TABLE properties (
     development_level INTEGER NOT NULL DEFAULT 0,
     assessed_value NUMERIC(20, 4) NOT NULL DEFAULT 0,
     last_tax_paid_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Add this
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), -- Add this
     UNIQUE(x_coord, y_coord)
 );
 

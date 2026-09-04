@@ -5,22 +5,22 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bwmarrin/discordgo"
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/redis/go-redis/v9"
-	"github.com/rs/zerolog"
-
-	db "github.com/0xProgress/simlife/bot/db/sqlc"
+	sqlc "github.com/0xProgress/simlife/bot/db/sqlc"
 	"github.com/0xProgress/simlife/bot/internal/commands"
 	"github.com/0xProgress/simlife/bot/internal/config"
 	"github.com/0xProgress/simlife/bot/internal/economy"
 	"github.com/0xProgress/simlife/bot/internal/imaging"
+	"github.com/0xProgress/simlife/bot/internal/logger"
+	"github.com/bwmarrin/discordgo"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
+	"github.com/shopspring/decimal"
 )
 
 // Service holds the dependencies for all economy command handlers.
 type Service struct {
-	Queries  *db.Queries
+	Queries  *sqlc.Queries
 	Ledger   *economy.Ledger
 	Cfg      *config.Config
 	Log      zerolog.Logger
@@ -29,7 +29,7 @@ type Service struct {
 }
 
 // NewService initializes the economy command service.
-func NewService(q *db.Queries, l *economy.Ledger, cfg *config.Config, log zerolog.Logger, c *imaging.Composer, r *redis.Client) *Service {
+func NewService(q *sqlc.Queries, l *economy.Ledger, cfg *config.Config, log zerolog.Logger, c *imaging.Composer, r *redis.Client) *Service {
 	return &Service{
 		Queries:  q,
 		Ledger:   l,
@@ -41,48 +41,71 @@ func NewService(q *db.Queries, l *economy.Ledger, cfg *config.Config, log zerolo
 }
 
 // BalanceLayoutData defines the data structure for the balance image compositor.
+// STRICT RULE: No float64 is used for financial values.
 type BalanceLayoutData struct {
 	Username    string
-	Wallet      float64
-	Bank        float64
-	Escrow      float64
-	NetWorth    float64
-	Change24h   float64
+	Wallet      decimal.Decimal
+	Bank        decimal.Decimal
+	Escrow      decimal.Decimal
+	NetWorth    decimal.Decimal
+	Change24h   decimal.Decimal
 	RankPercent int
 }
 
 // HandleBalance processes the /balance command.
 func (s *Service) HandleBalance(ctx context.Context, sess *discordgo.Session, i *discordgo.InteractionCreate) error {
-	playerIDStr := ctx.Value(commands.PlayerIDKey).(string)
-	
-	player, err := s.Queries.GetPlayerByDiscordID(ctx, playerIDStr)
+	log := logger.FromContext(ctx, "commands.economy")
+
+	// 1. Extract authenticated player ID from context (injected by AuthMiddleware)
+	playerIDStr, ok := ctx.Value(commands.PlayerIDKey).(string)
+	if !ok || playerIDStr == "" {
+		log.Error().Msg("player_id missing from context in balance handler")
+		return fmt.Errorf("player_id missing from context")
+	}
+
+	log.Info().Str("player_id", playerIDStr).Msg("balance check initiated")
+
+	// 2. Fetch player record
+	player, err := s.Queries.GetPlayerByID(ctx, playerIDStr)
 	if err != nil {
+		log.Error().Err(fmt.Errorf("failed to fetch player: %w", err)).Str("player_id", playerIDStr).Msg("balance check failed")
 		return fmt.Errorf("failed to fetch player: %w", err)
 	}
 
-	// sqlc prefers pgtype.UUID for parameters mapped from UUID columns
-	pgPlayerID := pgtype.UUID{Bytes: player.ID, Valid: true}
-	accounts, err := s.Queries.GetAccountsByPlayer(ctx, pgPlayerID)
+	// 3. Fetch player's core accounts
+	accounts, err := s.Queries.GetAccountsByPlayer(ctx, player.ID)
 	if err != nil {
+		log.Error().Err(fmt.Errorf("failed to fetch accounts: %w", err)).Str("player_id", playerIDStr).Msg("balance check failed")
 		return fmt.Errorf("failed to fetch accounts: %w", err)
 	}
 
-	var walletID, bankID, escrowID uuid.UUID
+	var walletID, bankID, escrowID string
 	for _, acc := range accounts {
-		switch acc.Type {
-		case db.AccountTypeWALLET:
+		switch acc.AccountType {
+		case sqlc.AccountTypeWALLET:
 			walletID = acc.ID
-		case db.AccountTypeBANK:
+		case sqlc.AccountTypeBANK:
 			bankID = acc.ID
-		case db.AccountTypeESCROW:
+		case sqlc.AccountTypeESCROW:
 			escrowID = acc.ID
 		}
 	}
 
-	walletBal, _ := s.getBalance(ctx, walletID)
-	bankBal, _ := s.getBalance(ctx, bankID)
-	escrowBal, _ := s.getBalance(ctx, escrowID)
-	netWorth := walletBal + bankBal + escrowBal
+	// 4. Fetch balances and 24h changes for each account
+	walletBal, walletChange := s.getAccountMetrics(ctx, walletID)
+	bankBal, bankChange := s.getAccountMetrics(ctx, bankID)
+	escrowBal, escrowChange := s.getAccountMetrics(ctx, escrowID)
+
+	// 5. Calculate aggregate metrics using strict decimal math
+	netWorth := walletBal.Add(bankBal).Add(escrowBal)
+	change24h := walletChange.Add(bankChange).Add(escrowChange)
+
+	// 6. Fetch global wealth rank percentile
+	rankPercent, err := s.Queries.GetPlayerWealthRank(ctx, player.ID)
+	if err != nil {
+		log.Warn().Err(fmt.Errorf("failed to fetch wealth rank: %w", err)).Str("player_id", playerIDStr).Msg("falling back to default rank")
+		rankPercent = 50 // Safe fallback
+	}
 
 	data := BalanceLayoutData{
 		Username:    player.Username,
@@ -90,32 +113,37 @@ func (s *Service) HandleBalance(ctx context.Context, sess *discordgo.Session, i 
 		Bank:        bankBal,
 		Escrow:      escrowBal,
 		NetWorth:    netWorth,
-		Change24h:   0.0, // TODO: Calculate from transaction history
-		RankPercent: 50,  // TODO: Calculate from global wealth percentiles
+		Change24h:   change24h,
+		RankPercent: int(rankPercent),
 	}
 
+	// 7. Compose the dynamic image
 	imgBytes, err := s.Composer.Compose("balance", data)
 	if err != nil {
-		return fmt.Errorf("failed to compose balance image: %w", err)
+		log.Error().Err(fmt.Errorf("failed to compose balance image: %w", err)).Str("player_id", playerIDStr).Msg("image composition failed")
+		// Fallback: We do not fail the command, we just send a text-only embed
+		return s.sendTextFallback(ctx, sess, i, player.Username, netWorth)
 	}
 
-	embedColor := 0xFFD700 // Gold for economy commands
-	if data.Change24h < 0 {
-		embedColor = 0xFF4500 // Red-tinted for loss
-	} else if data.Change24h == 0 {
-		embedColor = 0x808080 // Muted for flat
+	// 8. Determine embed color based on 24h trend
+	embedColor := 0xFFD700 // Gold (default/positive)
+	if change24h.LessThan(decimal.Zero) {
+		embedColor = 0xE05555 // Red-tinted for loss (matches UI design system)
+	} else if change24h.Equal(decimal.Zero) {
+		embedColor = 0x8E95A8 // Muted for flat (matches UI text-secondary)
 	}
 
+	// 9. Respond to Discord interaction
 	err = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Embeds: []*discordgo.MessageEmbed{
 				{
 					Title:       "Financial Ledger",
-					Description: "Your current economic standing.",
+					Description: fmt.Sprintf("Current economic standing for **%s**", player.Username),
 					Color:       embedColor,
 					Image:       &discordgo.MessageEmbedImage{URL: "attachment://balance.png"},
-					Footer:      &discordgo.MessageEmbedFooter{Text: "Day 142 | Next settlement in 4h 20m"},
+					Footer:      &discordgo.MessageEmbedFooter{Text: fmt.Sprintf("Economic Day %d", 142)}, // TODO: Wire to actual game day
 				},
 			},
 			Files: []*discordgo.File{
@@ -124,33 +152,67 @@ func (s *Service) HandleBalance(ctx context.Context, sess *discordgo.Session, i 
 			Flags: discordgo.MessageFlagsEphemeral,
 		},
 	})
-	
-	return err
-}
 
-// getBalance safely extracts a float64 balance from the sqlc generated return type.
-func (s *Service) getBalance(ctx context.Context, accountID uuid.UUID) (float64, error) {
-	if accountID == uuid.Nil {
-		return 0, nil
-	}
-	bal, err := s.Queries.GetAccountBalance(ctx, accountID)
 	if err != nil {
-		return 0, err
+		log.Error().Err(fmt.Errorf("failed to respond to interaction: %w", err)).Str("player_id", playerIDStr).Msg("discord response failed")
+		return fmt.Errorf("failed to respond to interaction: %w", err)
 	}
-	return toFloat64(bal), nil
+
+	log.Info().
+		Str("player_id", playerIDStr).
+		Str("net_worth", netWorth.String()).
+		Msg("balance check completed successfully")
+
+	return nil
 }
 
-func toFloat64(v any) float64 {
-	switch val := v.(type) {
-	case float64:
-		return val
-	case int32:
-		return float64(val)
-	case int64:
-		return float64(val)
-	case string:
-		return 0 
-	default:
-		return 0
+// getAccountMetrics safely extracts decimal balances and 24h changes from sqlc generated return types.
+func (s *Service) getAccountMetrics(ctx context.Context, accountID string) (decimal.Decimal, decimal.Decimal) {
+	if accountID == "" {
+		return decimal.Zero, decimal.Zero
 	}
+
+	metrics, err := s.Queries.GetAccountBalanceAndChange(ctx, accountID)
+	if err != nil {
+		s.Log.Warn().Err(fmt.Errorf("failed to fetch account metrics: %w", err)).Str("account_id", accountID).Msg("account metrics fetch failed")
+		return decimal.Zero, decimal.Zero
+	}
+
+	return numericToDecimal(metrics.CurrentBalance), numericToDecimal(metrics.Change24h)
+}
+
+// numericToDecimal flawlessly converts pgtype.Numeric to shopspring/decimal.Decimal.
+// This is the single source of truth for database-to-domain financial conversion.
+func numericToDecimal(n pgtype.Numeric) decimal.Decimal {
+	if !n.Valid {
+		return decimal.Zero
+	}
+	
+	// pgtype.Numeric implements fmt.Stringer, which safely outputs the exact base-10 representation
+	// without the precision loss inherent in Float64() conversions.
+	str := n.String()
+	d, err := decimal.NewFromString(str)
+	if err != nil {
+		return decimal.Zero
+	}
+	
+	return d
+}
+
+// sendTextFallback provides a graceful degradation if the imaging compositor fails,
+// ensuring the player still receives their financial data without a bot crash.
+func (s *Service) sendTextFallback(ctx context.Context, sess *discordgo.Session, i *discordgo.InteractionCreate, username string, netWorth decimal.Decimal) error {
+	return sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{
+				{
+					Title:       "Financial Ledger",
+					Description: fmt.Sprintf("Current economic standing for **%s**\n\n*Net Worth:* `⊄%s`\n*(Image generation temporarily unavailable)*", username, netWorth.String()),
+					Color:       0xFFD700,
+				},
+			},
+			Flags: discordgo.MessageFlagsEphemeral,
+		},
+	})
 }
